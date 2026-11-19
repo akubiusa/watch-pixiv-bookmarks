@@ -24,29 +24,30 @@ function isValidTokenJSON(data: object): data is { refresh_token: string } {
 /** Exit code signalling a permanent token failure. Must match entrypoint.sh. */
 const PERMANENT_AUTH_FAILURE_EXIT_CODE = 10
 
-async function getPixiv() {
+/**
+ * Refreshes the pixiv token and persists it.
+ * @returns The client, or `undefined` after a permanent refresh failure (exit code 10 is already set)
+ * @throws If the token file is missing or invalid, or the refresh fails for another reason
+ */
+async function getPixiv(): Promise<PixivClient | undefined> {
   const logger = Logger.configure('getPixiv')
   const tokenPath = process.env.PIXIV_TOKEN_PATH ?? 'data/token.json'
   if (!fs.existsSync(tokenPath)) {
-    logger.error(`🚨 Token file does not exist: ${tokenPath}`)
-    return
+    throw new Error(`Token file does not exist: ${tokenPath}`)
   }
 
   const tokenRaw = fs.readFileSync(tokenPath, 'utf8')
   if (!isJSON(tokenRaw)) {
-    logger.error(`🚨 Token file is not JSON: ${tokenPath}`)
-    return
+    throw new Error(`Token file is not JSON: ${tokenPath}`)
   }
   const tokenData = JSON.parse(tokenRaw)
   if (!isValidTokenJSON(tokenData)) {
-    logger.error(`🚨 Token file is not valid: ${tokenPath}`)
-    return
+    throw new Error(`Token file is not valid: ${tokenPath}`)
   }
 
   const inputRefreshToken = tokenData.refresh_token
   if (!inputRefreshToken) {
-    logger.error(`🚨 Refresh token is not defined: ${tokenPath}`)
-    return
+    throw new Error(`Refresh token is not defined: ${tokenPath}`)
   }
 
   let pixiv: PixivClient
@@ -115,11 +116,11 @@ async function processIllusts(
 
   const targetUserId = Number(process.env.PIXIV_USER_ID)
   if (!targetUserId) {
-    logger.error('🚨 Target user ID is not defined')
-    return
+    throw new Error('Target user ID is not defined')
   }
 
   const illusts = await getIllusts(pixiv, targetUserId)
+
   const filteredBookmarkIllusts = illusts
     .filter((previous, index, self) => {
       return self.findIndex((illust) => illust.id === previous.id) === index
@@ -215,11 +216,11 @@ async function processNovels(
 
   const targetUserId = Number(process.env.PIXIV_USER_ID)
   if (!targetUserId) {
-    logger.error('🚨 Target user ID is not defined')
-    return
+    throw new Error('Target user ID is not defined')
   }
 
   const novels = await getNovels(pixiv, targetUserId)
+
   const filteredBookmarkNovels = novels
     .filter((previous, index, self) => {
       return self.findIndex((novel) => novel.id === previous.id) === index
@@ -296,6 +297,22 @@ async function processNovels(
   }
 }
 
+/**
+ * Copies a thrown value into a fresh `Error` holding only its message and
+ * stack, because extra properties can carry credentials (for example the
+ * `input` of an invalid webhook URL error) that the logger would print.
+ * @returns A new `Error` that is safe to log
+ */
+function sanitizeError(error: unknown): Error {
+  const safe = new Error(error instanceof Error ? error.message : String(error))
+  if (error instanceof Error) {
+    // Keep the original stack; a new Error would point at this helper
+    // eslint-disable-next-line unicorn/no-error-property-assignment
+    safe.stack = error.stack
+  }
+  return safe
+}
+
 async function main() {
   const logger = Logger.configure('main')
 
@@ -320,16 +337,34 @@ async function main() {
       webhookUrl: discordWebhookUrl,
     })
   } else {
-    logger.error(
-      '🚨 Discord token and channel ID, or webhook URL is not defined'
+    throw new Error(
+      'Discord token and channel ID, or webhook URL is not defined'
     )
-    return
   }
 
-  await processIllusts(pixiv, discord, isFirst)
-  await processNovels(pixiv, discord, isFirst)
+  let failed = false
+  for (const stage of [processIllusts, processNovels]) {
+    try {
+      await stage(pixiv, discord, isFirst)
+    } catch (error) {
+      const safe = sanitizeError(error)
+      logger.error('🚨', safe)
+      failed = true
+    }
+  }
+  if (failed) {
+    process.exitCode = 1
+  }
 }
 
 ;(async () => {
-  await main()
+  try {
+    await main()
+  } catch (error) {
+    const safe = sanitizeError(error)
+    Logger.configure('main').error('🚨', safe)
+    if (process.exitCode !== PERMANENT_AUTH_FAILURE_EXIT_CODE) {
+      process.exitCode = 1
+    }
+  }
 })()
